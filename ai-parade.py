@@ -1,65 +1,66 @@
 from itertools import groupby
-from typing import Any, cast, override
 
-import numpy as np
-import ai_parade.custom_runner as aip
+import ai_parade.custom_definitions as aip
 import timm
 
 def include():
+	sep_dataset = [x.split(".") for x in sorted(timm.list_models(pretrained=True))]
+	model_2_dataset = {key: [(x[1] if len(x) == 2 else "") for x in group] for key, group in  groupby(sep_dataset, lambda x: x[0])}
+
+	splitted_models = [x.split("_") for x in sorted(model_2_dataset.keys())]
+	with_family, unknown_family = aip.parse_model_size(splitted_models, 1, 3)
+
+	parsed = [
+		("_".join(family), "_".join(model),  size + (i / len(models)))
+		for family, size, models in with_family
+		for i, model in enumerate(models)
+	]
+
+	parsed += [("_".join(models), "_".join(models), 1)
+		for models in unknown_family
+	]
+
 	metadata_list = []
-	models = sorted(timm.list_models(pretrained=True))
-	unknown:list[list[str]] = []
-	parsed:list[tuple[list[str], float | int, list[list[str]]]] = []
+	for family, model_name, size in parsed:
+			timm_ids = [(f"{model_name}.{dataset}" if dataset != "" else model_name) for dataset in model_2_dataset[model_name]]
+			cfgs = [timm.get_pretrained_cfg(timm_id) for timm_id in timm_ids]
+			cfgs = [cfg for cfg in cfgs if cfg is not None]
+			download_links = {
+				timm_id: f"https://huggingface.co/{cfg.hf_hub_id}/resolve/main/pytorch_model.bin" if cfg.hf_hub_id is not None else cfg.url
+				for timm_id, cfg in zip(timm_ids, cfgs) if cfg.hf_hub_id is not None or cfg.url is not None
+			}
 
-	splitted_models = [model.split("_") for model in models]
-	for k, group in groupby(splitted_models, lambda x: x[0]):
-		group_parsed, group_unknown = aip.parse_model_size(list(group), 1, 3)
-		parsed += group_parsed
-		unknown += group_unknown
-
-	parsed += [(model, 1, [model]) for model in unknown]
-
-	for family_name, base_size, models in parsed:
-		for i, model_name in enumerate(models):
-			model_name = "_".join(model_name)
-			cache_dir = "models_cache"
-			input_size = cast( list[int], timm.get_pretrained_cfg_value(model_name, "input_size"))
-			assert input_size[0] == 3
+			primary_idx = 0
+			cfg = cfgs[primary_idx]
+			assert cfg is not None
+			assert cfg.input_size[0] == 3
 			image_input = aip.ImageInput(
 				batchSize=1, 
-				height=input_size[1], 
-				width=input_size[2], 
+				height=cfg.input_size[1], 
+				width=cfg.input_size[2], 
 				channelOrder=aip.ImageInput.ChannelOrder.RGB, 
 				dataOrder=aip.ImageInput.DataOrder.NCHW, 
-				dataType=aip.ImageInput.DataType.FLOAT32, 
+				dataType=aip.ImageInput.DataType.float32,
+				means=cfg.mean, # pyright: ignore[reportArgumentType]
+				stds=cfg.std, # pyright: ignore[reportArgumentType]
 				)
 			metadata = aip.ModelMetadataApi(
 				name=model_name,
-				family="_".join(family_name),
-				format=aip.ModelFormat.PyTorch,
+				family=family,
+				size=size,
+				format=aip.ExactModelFormat(aip.ModelFormat.PyTorch),
 				task=aip.ModelTasks.Classification,
+				citation=cfg.paper_name,
+				citation_link=cfg.origin_url,
+				download_link=download_links, # pyright: ignore[reportArgumentType]
+				license=cfg.license,
 				image_input=image_input,
-				size=base_size+(i/1000),
-				get_runner=Runner,
+				output="",
+				dataset=model_2_dataset[model_name],
 				pytorch=aip.PyTorchOptionsApi(
 					model_import="timm", 
-					model_init_expression=f"module.create_model(model_name='{model_name}', pretrained=True, cache_dir='{cache_dir}', exportable=True)"
+					model_init_expression=f"module.create_model(model_name='{timm_ids[primary_idx]}', pretrained=False, exportable=True)"
 					),
-				citation_link=cast( str, timm.get_pretrained_cfg_value(model_name, "origin_url")),
-				citation=cast( str, timm.get_pretrained_cfg_value(model_name, "paper_name")),
-				license=cast( str, timm.get_pretrained_cfg_value(model_name, "license")),
 				)
 			metadata_list.append(metadata)
 	return metadata_list
-
-def softmax(x: Any):
-	return np.exp(x) / np.sum(np.exp(x))
-
-class Runner(aip.PyTorchRunner):
-	@override
-	@staticmethod
-	def _output_mapping(output: Any, model_metadata: aip.ModelMetadata) -> aip.ModelOutput:
-		probabilities = softmax(output)
-		max_index = np.argmax(probabilities)
-		return {"objects":[{ "confidence": float(probabilities[max_index]), "ImageNet_1k_class": int(max_index) }]}
-		return super()._output_mapping(output, model_metadata)
